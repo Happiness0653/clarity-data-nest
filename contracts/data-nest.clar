@@ -7,9 +7,12 @@
 (define-constant err-bucket-exists (err u102))
 (define-constant err-bucket-not-found (err u103))
 (define-constant err-insufficient-payment (err u104))
+(define-constant err-invalid-data (err u105))
+(define-constant err-bucket-full (err u106))
 
 ;; Storage cost in STX per byte
 (define-constant storage-cost-per-byte u1)
+(define-constant max-bucket-size u1048576) ;; 1MB max per bucket
 
 ;; Data structures
 (define-map buckets
@@ -36,6 +39,16 @@
 ;; Data vars
 (define-data-var next-bucket-id uint u1)
 
+;; Events
+(define-data-var last-event-id uint u0)
+
+(define-private (emit-event (event-type (string-utf8 64)) (bucket-id uint))
+  (let ((event-id (+ (var-get last-event-id) u1)))
+    (print { event-id: event-id, type: event-type, bucket: bucket-id, timestamp: block-height })
+    (var-set last-event-id event-id)
+  )
+)
+
 ;; Public functions
 (define-public (create-bucket (name (string-utf8 64)) (is-public bool))
   (let ((bucket-id (var-get next-bucket-id)))
@@ -51,6 +64,7 @@
       }
     )
     (var-set next-bucket-id (+ bucket-id u1))
+    (emit-event "bucket-created" bucket-id)
     (ok bucket-id)
   )
 )
@@ -58,8 +72,12 @@
 (define-public (store-data (bucket-id uint) (key (string-utf8 128)) (value (string-utf8 1024)))
   (let (
     (bucket (unwrap! (map-get? buckets { bucket-id: bucket-id }) err-bucket-not-found))
-    (payment (* (len value) storage-cost-per-byte))
+    (value-len (len value))
+    (payment (* value-len storage-cost-per-byte))
+    (new-size (+ (get size bucket) value-len))
   )
+    (asserts! (> value-len u0) err-invalid-data)
+    (asserts! (<= new-size max-bucket-size) err-bucket-full)
     (asserts! (or
       (is-eq tx-sender (get owner bucket))
       (get can-write (default-to { can-read: false, can-write: false }
@@ -67,39 +85,11 @@
     ) err-not-authorized)
     (try! (stx-transfer? payment tx-sender contract-owner))
     (map-set bucket-data { bucket-id: bucket-id, key: key } { value: value })
+    (map-set buckets { bucket-id: bucket-id }
+      (merge bucket { size: new-size }))
+    (emit-event "data-stored" bucket-id)
     (ok true)
   )
 )
 
-(define-public (grant-permission
-  (bucket-id uint)
-  (user principal)
-  (can-read bool)
-  (can-write bool)
-)
-  (let ((bucket (unwrap! (map-get? buckets { bucket-id: bucket-id }) err-bucket-not-found)))
-    (asserts! (is-eq tx-sender (get owner bucket)) err-not-authorized)
-    (map-set bucket-permissions
-      { bucket-id: bucket-id, user: user }
-      { can-read: can-read, can-write: can-write }
-    )
-    (ok true)
-  )
-)
-
-;; Read only functions
-(define-read-only (get-bucket-info (bucket-id uint))
-  (map-get? buckets { bucket-id: bucket-id })
-)
-
-(define-read-only (get-data (bucket-id uint) (key (string-utf8 128)))
-  (let ((bucket (unwrap! (map-get? buckets { bucket-id: bucket-id }) err-bucket-not-found)))
-    (asserts! (or
-      (get is-public bucket)
-      (is-eq tx-sender (get owner bucket))
-      (get can-read (default-to { can-read: false, can-write: false }
-        (map-get? bucket-permissions { bucket-id: bucket-id, user: tx-sender })))
-    ) err-not-authorized)
-    (map-get? bucket-data { bucket-id: bucket-id, key: key })
-  )
-)
+[... rest of the contract remains the same ...]
