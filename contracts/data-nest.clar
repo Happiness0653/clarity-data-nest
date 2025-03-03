@@ -9,6 +9,7 @@
 (define-constant err-insufficient-payment (err u104))
 (define-constant err-invalid-data (err u105))
 (define-constant err-bucket-full (err u106))
+(define-constant err-key-not-found (err u107))
 
 ;; Storage cost in STX per byte
 (define-constant storage-cost-per-byte u1)
@@ -38,14 +39,20 @@
 
 ;; Data vars
 (define-data-var next-bucket-id uint u1)
-
-;; Events
 (define-data-var last-event-id uint u0)
 
+;; Private functions
 (define-private (emit-event (event-type (string-utf8 64)) (bucket-id uint))
   (let ((event-id (+ (var-get last-event-id) u1)))
     (print { event-id: event-id, type: event-type, bucket: bucket-id, timestamp: block-height })
     (var-set last-event-id event-id)
+  )
+)
+
+(define-private (calculate-storage-delta (old-value-len uint) (new-value-len uint))
+  (if (> new-value-len old-value-len)
+    (- new-value-len old-value-len)
+    u0
   )
 )
 
@@ -72,18 +79,26 @@
 (define-public (store-data (bucket-id uint) (key (string-utf8 128)) (value (string-utf8 1024)))
   (let (
     (bucket (unwrap! (map-get? buckets { bucket-id: bucket-id }) err-bucket-not-found))
-    (value-len (len value))
-    (payment (* value-len storage-cost-per-byte))
-    (new-size (+ (get size bucket) value-len))
+    (existing-data (map-get? bucket-data { bucket-id: bucket-id, key: key }))
+    (new-value-len (len value))
+    (old-value-len (default-to u0 (match existing-data value-data (len (get value value-data)))))
+    (storage-delta (calculate-storage-delta old-value-len new-value-len))
+    (new-size (+ (get size bucket) storage-delta))
   )
-    (asserts! (> value-len u0) err-invalid-data)
+    (asserts! (> new-value-len u0) err-invalid-data)
     (asserts! (<= new-size max-bucket-size) err-bucket-full)
     (asserts! (or
       (is-eq tx-sender (get owner bucket))
       (get can-write (default-to { can-read: false, can-write: false }
         (map-get? bucket-permissions { bucket-id: bucket-id, user: tx-sender })))
     ) err-not-authorized)
-    (try! (stx-transfer? payment tx-sender contract-owner))
+    
+    ;; Only charge for net new storage
+    (if (> storage-delta u0)
+      (try! (stx-transfer? (* storage-delta storage-cost-per-byte) tx-sender contract-owner))
+      true
+    )
+    
     (map-set bucket-data { bucket-id: bucket-id, key: key } { value: value })
     (map-set buckets { bucket-id: bucket-id }
       (merge bucket { size: new-size }))
@@ -92,4 +107,23 @@
   )
 )
 
-[... rest of the contract remains the same ...]
+(define-public (delete-data (bucket-id uint) (key (string-utf8 128)))
+  (let (
+    (bucket (unwrap! (map-get? buckets { bucket-id: bucket-id }) err-bucket-not-found))
+    (existing-data (unwrap! (map-get? bucket-data { bucket-id: bucket-id, key: key }) err-key-not-found))
+    (value-len (len (get value existing-data)))
+    (new-size (- (get size bucket) value-len))
+  )
+    (asserts! (or
+      (is-eq tx-sender (get owner bucket))
+      (get can-write (default-to { can-read: false, can-write: false }
+        (map-get? bucket-permissions { bucket-id: bucket-id, user: tx-sender })))
+    ) err-not-authorized)
+    
+    (map-delete bucket-data { bucket-id: bucket-id, key: key })
+    (map-set buckets { bucket-id: bucket-id }
+      (merge bucket { size: new-size }))
+    (emit-event "data-deleted" bucket-id)
+    (ok true)
+  )
+)
